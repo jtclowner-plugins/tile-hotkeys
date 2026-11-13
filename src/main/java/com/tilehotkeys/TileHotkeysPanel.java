@@ -488,11 +488,10 @@ final class TileHotkeysPanel extends PluginPanel
             });
             mode.addActionListener(event ->
             {
-                int index = plugin.getGroups().indexOf(group);
                 Mode newMode = (Mode) mode.getSelectedItem();
-                if (!updatingSettings && index >= 0 && newMode != null && newMode != group.getMode())
+                if (!updatingSettings && newMode != null && newMode != group.getMode())
                 {
-                    plugin.setGroupMode(index, newMode);
+                    plugin.setGroupMode(group, newMode);
                     refresh();
                 }
             });
@@ -503,10 +502,9 @@ final class TileHotkeysPanel extends PluginPanel
             recordingHotkey = false;
             pendingModifierHotkey = null;
             hotkey.setFocusTraversalKeysEnabled(true);
-            int index = plugin.getGroups().indexOf(group);
-            if (keybind != null && index >= 0)
+            if (keybind != null)
             {
-                plugin.setGroupHotkey(index, keybind);
+                plugin.setGroupHotkey(group, keybind);
             }
             showHotkey();
         }
@@ -652,13 +650,12 @@ final class TileHotkeysPanel extends PluginPanel
                         dropIndex = -1;
                         packs.repaint();
                         int from = group.packs.indexOf(pack);
-                        int groupIndex = plugin.getGroups().indexOf(group);
-                        if (insertion >= 0 && from >= 0 && groupIndex >= 0)
+                        if (insertion >= 0 && from >= 0)
                         {
                             int to = insertion > from ? insertion - 1 : insertion;
                             if (to != from)
                             {
-                                plugin.movePack(groupIndex, from, to);
+                                plugin.movePack(group, pack, to);
                                 reveal(group, pack);
                             }
                         }

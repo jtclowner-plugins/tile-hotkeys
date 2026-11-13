@@ -5,6 +5,7 @@ import com.google.gson.Gson;
 import com.google.gson.JsonSyntaxException;
 import com.google.gson.reflect.TypeToken;
 import com.google.inject.Provides;
+import com.tilehotkeys.TileProjectionCache.Marker;
 import java.awt.Toolkit;
 import java.awt.datatransfer.DataFlavor;
 import java.awt.datatransfer.StringSelection;
@@ -15,10 +16,9 @@ import java.io.IOException;
 import java.lang.reflect.Type;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import javax.inject.Inject;
 import javax.swing.SwingUtilities;
 import lombok.extern.slf4j.Slf4j;
@@ -27,6 +27,7 @@ import net.runelite.api.WorldEntity;
 import net.runelite.api.WorldView;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.WorldViewLoaded;
+import net.runelite.api.events.WorldViewUnloaded;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.config.Keybind;
 import net.runelite.client.eventbus.Subscribe;
@@ -64,9 +65,11 @@ public class TileHotkeysPlugin extends Plugin implements KeyListener
     @Inject private TileHotkeysOverlay overlay;
 
     private final List<TileHotkeyGroup> groups = new ArrayList<>();
-    private final Set<Integer> pressedKeys = ConcurrentHashMap.newKeySet();
-    private TileHotkeysPanel panel;
-    private NavigationButton navigationButton;
+    private final TileProjectionCache projections = new TileProjectionCache();
+    private volatile List<Marker> activeMarkers = List.of();
+    private final Set<Integer> pressedKeys = new HashSet<>();
+    private volatile TileHotkeysPanel panel;
+    private volatile NavigationButton navigationButton;
 
     @Provides
     TileHotkeysConfig provideConfig(ConfigManager configManager)
@@ -75,7 +78,7 @@ public class TileHotkeysPlugin extends Plugin implements KeyListener
     }
 
     @Override
-    protected void startUp()
+    protected synchronized void startUp()
     {
         loadGroups();
         panel = new TileHotkeysPanel(this);
@@ -92,18 +95,20 @@ public class TileHotkeysPlugin extends Plugin implements KeyListener
     }
 
     @Override
-    protected void shutDown()
+    protected synchronized void shutDown()
     {
         keyManager.unregisterKeyListener(this);
         overlayManager.remove(overlay);
         if (navigationButton != null) clientToolbar.removeNavigation(navigationButton);
         groups.clear();
+        activeMarkers = List.of();
+        projections.clear();
         panel = null;
         navigationButton = null;
         pressedKeys.clear();
     }
 
-    private void loadGroups()
+    private synchronized void loadGroups()
     {
         groups.clear();
         String json = configManager.getConfiguration(CONFIG_GROUP, GROUPS_KEY);
@@ -119,6 +124,7 @@ public class TileHotkeysPlugin extends Plugin implements KeyListener
                 log.warn("Unable to load saved tile hotkey groups", ex);
             }
         }
+        publishActiveMarkers();
     }
 
     void saveGroups()
@@ -128,9 +134,9 @@ public class TileHotkeysPlugin extends Plugin implements KeyListener
         refreshPanel();
     }
 
-    List<TileHotkeyGroup> getGroups() { return Collections.unmodifiableList(groups); }
+    synchronized List<TileHotkeyGroup> getGroups() { return List.copyOf(groups); }
 
-    TileHotkeyGroup addGroup(String name)
+    synchronized TileHotkeyGroup addGroup(String name)
     {
         TileHotkeyGroup group = new TileHotkeyGroup(name);
         groups.add(group);
@@ -138,7 +144,7 @@ public class TileHotkeysPlugin extends Plugin implements KeyListener
         return group;
     }
 
-    boolean renameGroup(TileHotkeyGroup group, String name)
+    synchronized boolean renameGroup(TileHotkeyGroup group, String name)
     {
         String trimmed = name.trim();
         if (!groups.contains(group) || trimmed.isEmpty() || trimmed.equals(group.name)) return false;
@@ -147,43 +153,46 @@ public class TileHotkeysPlugin extends Plugin implements KeyListener
         return true;
     }
 
-    TileHotkeyPack addSpacer(TileHotkeyGroup group)
+    synchronized TileHotkeyPack addSpacer(TileHotkeyGroup group)
     {
         if (!groups.contains(group) || group.getMode() != TileHotkeyGroup.Mode.CYCLE) return null;
         TileHotkeyPack spacer = new TileHotkeyPack("Spacer");
         group.packs.add(spacer);
+        publishActiveMarkers();
         saveGroups();
         return spacer;
     }
 
-    void removeGroup(TileHotkeyGroup group)
+    synchronized void removeGroup(TileHotkeyGroup group)
     {
-        if (groups.remove(group)) saveGroups();
+        if (groups.remove(group))
+        {
+            publishActiveMarkers();
+            saveGroups();
+        }
     }
 
-    void setGroupMode(int index, TileHotkeyGroup.Mode newMode)
+    synchronized void setGroupMode(TileHotkeyGroup group, TileHotkeyGroup.Mode newMode)
     {
-        if (index < 0 || index >= groups.size()) return;
-        TileHotkeyGroup group = groups.get(index);
-        if (group.getMode() == newMode) return;
+        if (!groups.contains(group) || group.getMode() == newMode) return;
         group.resetMode(newMode);
+        publishActiveMarkers();
         saveGroups();
     }
 
-    void setGroupHotkey(int index, Keybind keybind)
+    synchronized void setGroupHotkey(TileHotkeyGroup group, Keybind keybind)
     {
-        if (index < 0 || index >= groups.size()) return;
-        TileHotkeyGroup group = groups.get(index);
+        if (!groups.contains(group)) return;
         if (group.keyCode != keybind.getKeyCode() || group.modifiers != keybind.getModifiers())
         {
-            group.releaseHotkey();
+            if (group.releaseHotkey()) publishActiveMarkers();
         }
         group.keyCode = keybind.getKeyCode();
         group.modifiers = keybind.getModifiers();
         saveGroups();
     }
 
-    TileHotkeyPack importPackFromClipboard(TileHotkeyGroup group, String name)
+    synchronized TileHotkeyPack importPackFromClipboard(TileHotkeyGroup group, String name)
     {
         if (!groups.contains(group)) return null;
         try
@@ -198,6 +207,7 @@ public class TileHotkeysPlugin extends Plugin implements KeyListener
             }
             if (pack.tiles.isEmpty()) return null;
             group.packs.add(pack);
+            publishActiveMarkers();
             saveGroups();
             return pack;
         }
@@ -208,7 +218,7 @@ public class TileHotkeysPlugin extends Plugin implements KeyListener
         }
     }
 
-    TileHotkeyGroup importGroupFromClipboard()
+    synchronized TileHotkeyGroup importGroupFromClipboard()
     {
         try
         {
@@ -219,6 +229,7 @@ public class TileHotkeysPlugin extends Plugin implements KeyListener
             for (TileHotkeyPack pack : imported.packs) pack.tiles.removeIf(tile -> tile == null);
             imported.resetMode(imported.getMode());
             groups.add(imported);
+            publishActiveMarkers();
             saveGroups();
             return imported;
         }
@@ -229,21 +240,21 @@ public class TileHotkeysPlugin extends Plugin implements KeyListener
         }
     }
 
-    int exportPack(TileHotkeyGroup group, TileHotkeyPack pack)
+    synchronized int exportPack(TileHotkeyGroup group, TileHotkeyPack pack)
     {
         if (!groups.contains(group) || !group.packs.contains(pack) || pack.tiles.isEmpty()) return 0;
         Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(gson.toJson(pack.tiles)), null);
         return pack.tiles.size();
     }
 
-    boolean exportGroup(TileHotkeyGroup group)
+    synchronized boolean exportGroup(TileHotkeyGroup group)
     {
         if (!groups.contains(group)) return false;
         Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(gson.toJson(group)), null);
         return true;
     }
 
-    void removePack(TileHotkeyGroup group, TileHotkeyPack pack)
+    synchronized void removePack(TileHotkeyGroup group, TileHotkeyPack pack)
     {
         if (!groups.contains(group)) return;
         int index = group.packs.indexOf(pack);
@@ -251,10 +262,11 @@ public class TileHotkeysPlugin extends Plugin implements KeyListener
         group.packs.remove(index);
         if (group.activePackIndex == index) group.activePackIndex = -1;
         else if (group.activePackIndex > index) group.activePackIndex--;
+        publishActiveMarkers();
         saveGroups();
     }
 
-    boolean renamePack(TileHotkeyGroup group, TileHotkeyPack pack, String name)
+    synchronized boolean renamePack(TileHotkeyGroup group, TileHotkeyPack pack, String name)
     {
         if (!groups.contains(group) || !group.packs.contains(pack) || pack.isSpacer()) return false;
         String trimmed = name.trim();
@@ -264,16 +276,16 @@ public class TileHotkeysPlugin extends Plugin implements KeyListener
         return true;
     }
 
-    void movePack(int groupIndex, int fromIndex, int toIndex)
+    synchronized void movePack(TileHotkeyGroup group, TileHotkeyPack pack, int toIndex)
     {
-        if (groupIndex < 0 || groupIndex >= groups.size()) return;
-        TileHotkeyGroup group = groups.get(groupIndex);
-        if (fromIndex < 0 || fromIndex >= group.packs.size()
-            || toIndex < 0 || toIndex >= group.packs.size() || fromIndex == toIndex) return;
+        if (!groups.contains(group)) return;
+        int fromIndex = group.packs.indexOf(pack);
+        if (fromIndex < 0 || toIndex < 0 || toIndex >= group.packs.size() || fromIndex == toIndex) return;
 
-        TileHotkeyPack pack = group.packs.remove(fromIndex);
+        group.packs.remove(fromIndex);
         group.packs.add(toIndex, pack);
         group.activePackIndex = adjustMovedIndex(group.activePackIndex, fromIndex, toIndex);
+        publishActiveMarkers();
         saveGroups();
     }
 
@@ -287,7 +299,8 @@ public class TileHotkeysPlugin extends Plugin implements KeyListener
 
     private void refreshPanel()
     {
-        if (panel != null) SwingUtilities.invokeLater(panel::refresh);
+        TileHotkeysPanel currentPanel = panel;
+        if (currentPanel != null) SwingUtilities.invokeLater(currentPanel::refresh);
     }
 
     private void updateSidebarButton()
@@ -308,7 +321,7 @@ public class TileHotkeysPlugin extends Plugin implements KeyListener
     public void keyTyped(KeyEvent event) { }
 
     @Override
-    public void keyPressed(KeyEvent event)
+    public synchronized void keyPressed(KeyEvent event)
     {
         int keyCode = event.getExtendedKeyCode();
         if (keyCode == KeyEvent.VK_UNDEFINED || !pressedKeys.add(keyCode))
@@ -325,6 +338,7 @@ public class TileHotkeysPlugin extends Plugin implements KeyListener
             matched = true;
             save |= !group.getMode().isHoldMode();
         }
+        if (matched) publishActiveMarkers();
         if (save)
         {
             saveGroups();
@@ -336,7 +350,7 @@ public class TileHotkeysPlugin extends Plugin implements KeyListener
     }
 
     @Override
-    public void keyReleased(KeyEvent event)
+    public synchronized void keyReleased(KeyEvent event)
     {
         int keyCode = event.getExtendedKeyCode();
         pressedKeys.remove(keyCode);
@@ -349,11 +363,15 @@ public class TileHotkeysPlugin extends Plugin implements KeyListener
                 changed |= group.releaseHotkey();
             }
         }
-        if (changed) refreshPanel();
+        if (changed)
+        {
+            publishActiveMarkers();
+            refreshPanel();
+        }
     }
 
     @Override
-    public void focusLost()
+    public synchronized void focusLost()
     {
         pressedKeys.clear();
         boolean changed = false;
@@ -361,44 +379,60 @@ public class TileHotkeysPlugin extends Plugin implements KeyListener
         {
             changed |= group.releaseHotkey();
         }
-        if (changed) refreshPanel();
+        if (changed)
+        {
+            publishActiveMarkers();
+            refreshPanel();
+        }
     }
 
     Collection<RenderTile> getActiveTiles()
     {
-        List<RenderTile> result = new ArrayList<>();
+        List<Marker> markers = activeMarkers;
+        if (markers.isEmpty()) return List.of();
         WorldView top = client.getTopLevelWorldView();
-        if (top == null) return result;
-        addActiveTiles(result, top);
-        for (WorldEntity entity : top.worldEntities()) addActiveTiles(result, entity.getWorldView());
-        return result;
+        if (top == null) return List.of();
+        List<RenderTile> topTiles = projections.project(top, markers);
+        List<RenderTile> combined = null;
+        for (WorldEntity entity : top.worldEntities())
+        {
+            List<RenderTile> tiles = projections.project(entity.getWorldView(), markers);
+            if (!tiles.isEmpty())
+            {
+                if (combined == null) combined = new ArrayList<>(topTiles);
+                combined.addAll(tiles);
+            }
+        }
+        return combined == null ? topTiles : List.copyOf(combined);
     }
 
-    private void addActiveTiles(List<RenderTile> result, WorldView view)
+    // Build under the model lock and publish in one write. Rendering never reads groups or packs.
+    private void publishActiveMarkers()
     {
+        List<Marker> markers = new ArrayList<>();
         for (TileHotkeyGroup group : groups)
         {
             if (group.getMode() != TileHotkeyGroup.Mode.CYCLE)
             {
                 if (group.isGroupVisible())
                 {
-                    for (TileHotkeyPack pack : group.packs) addPackTiles(result, view, pack);
+                    for (TileHotkeyPack pack : group.packs) addPackMarkers(markers, pack);
                 }
             }
             else if (group.activePackIndex >= 0 && group.activePackIndex < group.packs.size())
             {
-                addPackTiles(result, view, group.packs.get(group.activePackIndex));
+                addPackMarkers(markers, group.packs.get(group.activePackIndex));
             }
         }
+        if (!activeMarkers.equals(markers)) activeMarkers = List.copyOf(markers);
     }
 
-    private void addPackTiles(List<RenderTile> result, WorldView view, TileHotkeyPack pack)
+    private static void addPackMarkers(List<Marker> markers, TileHotkeyPack pack)
     {
         for (HotkeyTile tile : pack.tiles)
         {
             WorldPoint point = WorldPoint.fromRegion(tile.regionId, tile.regionX, tile.regionY, tile.z);
-            for (WorldPoint local : WorldPoint.toLocalInstance(view, point))
-                result.add(new RenderTile(view, local, tile.color));
+            markers.add(new Marker(point, tile.color, tile.label));
         }
     }
 
@@ -415,23 +449,36 @@ public class TileHotkeysPlugin extends Plugin implements KeyListener
     public void onProfileChanged(ProfileChanged event)
     {
         loadGroups();
+        projections.clear();
         updateSidebarButton();
         refreshPanel();
     }
 
     @Subscribe
-    public void onWorldViewLoaded(WorldViewLoaded event) { refreshPanel(); }
+    public void onWorldViewLoaded(WorldViewLoaded event)
+    {
+        projections.invalidate(event.getWorldView());
+        refreshPanel();
+    }
+
+    @Subscribe
+    public void onWorldViewUnloaded(WorldViewUnloaded event)
+    {
+        projections.invalidate(event.getWorldView());
+    }
 
     static final class RenderTile
     {
         final WorldView worldView;
         final WorldPoint point;
         final java.awt.Color color;
-        RenderTile(WorldView worldView, WorldPoint point, java.awt.Color color)
+        final String label;
+        RenderTile(WorldView worldView, WorldPoint point, java.awt.Color color, String label)
         {
             this.worldView = worldView;
             this.point = point;
             this.color = color;
+            this.label = label;
         }
     }
 }
